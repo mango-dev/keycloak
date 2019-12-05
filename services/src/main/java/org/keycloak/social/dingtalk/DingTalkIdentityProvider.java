@@ -34,7 +34,9 @@ import java.io.UnsupportedEncodingException;
 import java.net.URI;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.keycloak.saml.processing.web.util.RedirectBindingUtil.urlEncode;
@@ -93,7 +95,7 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
         user.setUsername(getJsonProperty(profile, "openid"));
         user.setBrokerUserId(getJsonProperty(profile, "openid"));
         user.setModelUsername(getJsonProperty(profile, "openid"));
-        user.setName(getJsonProperty(profile, "nickname"));
+        user.setName(getJsonProperty(profile, "nick"));
         user.setIdpConfig(getConfig());
         user.setIdp(this);
         AbstractJsonUserAttributeMapper.storeUserProfileForMapper(user, profile, getConfig().getAlias());
@@ -119,20 +121,29 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
 
             logger.info("4.dingtalk:获取用户token信息");
             //获取openid信息
-            profile = getUserInfoByCode(authorizationCode).asJson();
+//            profile = getUserInfoByCode(authorizationCode).asJson();
+            String profileStr = getUserInfoByCode(authorizationCode).asString();
+            profileStr= new String(profileStr.getBytes("gbk"),"utf-8");
+            // logger.info("4.1.dingtalk:profile=" + profileStr);
+            profile=asJsonNode(profileStr);
+            String errcode = getJsonProperty(profile, "errcode");
+            if (errcode == "0") {
+                JsonNode profile_user_info = profile.get("user_info");
+                // logger.info("4.1.1.dingtalk:user_info_str="+profile_user_info.toString());
 
-            logger.info("4.1.dingtalk:profile="+profile.toString());
+                String unionid = getJsonProperty(profile_user_info, "unionid");
 
-            String unionid = getJsonProperty(profile, "unionid");
+                //            logger.info("4.2.dingtalk:获取用户userid信息");
+                //            //获取userid信息
+                //            String url = PROFILE_URL.replace("ACCESS_TOKEN", accessToken).replace("UNIONID", unionid);
+                //            JsonNode userfile = SimpleHttp.doGet(url, session).asJson();
+                //
+                //            logger.info("4.3.dingtalk:userfile="+userfile.toString());
 
-//            logger.info("4.2.dingtalk:获取用户userid信息");
-//            //获取userid信息
-//            String url = PROFILE_URL.replace("ACCESS_TOKEN", accessToken).replace("UNIONID", unionid);
-//            JsonNode userfile = SimpleHttp.doGet(url, session).asJson();
-//
-//            logger.info("4.3.dingtalk:userfile="+userfile.toString());
-
-            context = extractIdentityFromProfile(null, profile);
+                context = extractIdentityFromProfile(null, profile_user_info);
+            } else {
+                throw new IdentityBrokerException("getUserInfoByCode.error：" + profileStr.toString());
+            }
         } catch (IOException e) {
             logger.error(e);
         } catch (NoSuchAlgorithmException e) {
@@ -185,10 +196,14 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
     //获取openid
     public SimpleHttp getUserInfoByCode(String authorizationCode) throws NoSuchAlgorithmException, InvalidKeyException, IOException {
         String timestamp = String.valueOf(System.currentTimeMillis());
-        return SimpleHttp.doPost(API_User, session).param("tmp_auth_code", authorizationCode)
-                .param("accessKey", getConfig().getClientId())
-                .param("timestamp", timestamp)
-                .param("signature", SHA256(timestamp));
+        String url=String.format("%s?accessKey=%s&timestamp=%s&signature=%s",API_User,getConfig().getClientId(),timestamp,SHA256(timestamp));
+        // logger.info("4.0.2.dingtalk:getUserInfoByCode=>"+url);
+        Map params = new HashMap<String, String>();
+        params.put("tmp_auth_code", authorizationCode);
+        return SimpleHttp.doPost(url, session).json(params);
+                // .param("accessKey", getConfig().getClientId())
+                // .param("timestamp", timestamp)
+                // .param("signature", SHA256(timestamp));
     }
     private String SHA256(String timestamp) throws IOException, NoSuchAlgorithmException, InvalidKeyException {
         // 根据timestamp, appSecret计算签名值
@@ -198,6 +213,7 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
         byte[] signatureBytes = mac.doFinal(stringToSign.getBytes("UTF-8"));
         String signature = new String(Base64.encodeBase64(signatureBytes));
         String urlEncodeSignature = urlEncode(signature);
+        // logger.info("4.0.1.dingtalk:构造signature=>"+"ClientSecret:"+getConfig().getClientSecret()+",timestamp:"+timestamp+",signature:"+signature+",signature:"+urlEncodeSignature);
         return urlEncodeSignature;
     }
 
@@ -220,6 +236,7 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
             uriBuilder = UriBuilder.fromUri(getConfig().getAuthorizationUrl());
             uriBuilder.queryParam(OAUTH2_PARAMETER_SCOPE, getConfig().getDefaultScope())
                     .queryParam(OAUTH2_PARAMETER_STATE, request.getState().getEncoded())
+                    .queryParam(OAUTH2_PARAMETER_RESPONSE_TYPE, "code")
                     .queryParam(OAUTH2_PARAMETER_CLIENT_ID, getConfig().getClientId())
                     .queryParam(OAUTH2_PARAMETER_REDIRECT_URI, request.getRedirectUri());
         }
@@ -350,8 +367,8 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
             }
             // 获取ding_appid的access_token
             //https://oapi.dingtalk.com/gettoken?appkey=appkey&appsecret=appsecret
-            String url = "{0}?{1}={2}&{3}={4}";
-            url = String.format(url, getConfig().getTokenUrl(),
+            //String url = "%s?%s=%s&%s=%s";
+            String url = String.format("%s?%s=%s&%s=%s", getConfig().getTokenUrl(),
                     DING_PARAMETER_CLIENT_ID, getConfig().getConfig().get(DING_APPID),
                     DING_PARAMETER_CLIENT_SECRET, getConfig().getConfig().get(DING_APPIDKEY)
             );
