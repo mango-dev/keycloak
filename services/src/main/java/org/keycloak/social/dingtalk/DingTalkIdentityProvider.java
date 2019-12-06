@@ -3,7 +3,13 @@ package org.keycloak.social.dingtalk;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
-import org.apache.commons.codec.binary.Base64;
+//import org.apache.commons.codec.binary.Base64;
+import java.util.Base64;
+
+import org.infinispan.Cache;
+import org.infinispan.configuration.cache.ConfigurationBuilder;
+import org.infinispan.manager.DefaultCacheManager;
+
 import org.keycloak.OAuth2Constants;
 import org.keycloak.broker.oidc.AbstractOAuth2IdentityProvider;
 import org.keycloak.broker.oidc.OAuth2IdentityProviderConfig;
@@ -38,6 +44,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import static org.keycloak.saml.processing.web.util.RedirectBindingUtil.urlEncode;
 
@@ -50,9 +57,9 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
 
     public static final String API_User = "https://oapi.dingtalk.com/sns/getuserinfo_bycode";
 
-    public static final String WECHAT_AUTH_URL = "https://open.weixin.qq.com/connect/oauth2/authorize";
-    public static final String WECHAT_TOKEN_URL = "https://oapi.dingtalk.com/gettoken";
-    public static final String WECHAT_DEFAULT_SCOPE = "snsapi_userinfo";
+    public static final String DING_AUTH_URL = "https://open.weixin.qq.com/connect/oauth2/authorize";
+    public static final String DING_TOKEN_URL = "https://oapi.dingtalk.com/gettoken";
+    public static final String DING_DEFAULT_SCOPE = "snsapi_userinfo";
 
     public static final String PROFILE_URL = "https://oapi.dingtalk.com/user/getUseridByUnionid?access_token=ACCESS_TOKEN&unionid=UNIONID&lang=zh_CN";
 
@@ -66,7 +73,14 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
     public static final String DING_APPIDKEY = "clientSecret2";
 
     public static final String OPENID = "openid";
-    public static final String WECHATFLAG = "micromessenger";
+    public static final String USER_AGENT = "aliApp(dingtalk/";
+
+    private String ACCESS_TOKEN_KEY = "access_token";
+    private String ACCESS_TOKEN_CACHE_KEY = "dingtalk_work_sso_access_token";
+    private static DefaultCacheManager _cacheManager;
+    public static String DING_WORK_CACHE_NAME = "dingtalk_work_sso";
+    public static Cache<String, String> sso_cache = get_cache();
+
 
     public DingTalkIdentityProvider(KeycloakSession session, OAuth2IdentityProviderConfig config) {
         super(session, config);
@@ -74,6 +88,72 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
         logger.info("1.dingtalk:开始初始化DingTalk");
         config.setAuthorizationUrl(AUTH_URL);
         config.setTokenUrl(TOKEN_URL);
+    }
+
+
+
+
+    private static DefaultCacheManager getCacheManager() {
+        if (_cacheManager == null) {
+            ConfigurationBuilder config = new ConfigurationBuilder();
+            _cacheManager = new DefaultCacheManager();
+            _cacheManager.defineConfiguration(DING_WORK_CACHE_NAME, config.build());
+        }
+        return _cacheManager;
+    }
+
+    private static Cache<String, String> get_cache() {
+        try {
+            Cache<String, String> cache = getCacheManager().getCache(DING_WORK_CACHE_NAME);
+            logger.info(cache);
+            return cache;
+        } catch (Exception e) {
+            logger.error(e);
+            e.printStackTrace(System.out);
+            throw e;
+        }
+    }
+
+    private String get_access_token() {
+        try {
+            String token = sso_cache.get(ACCESS_TOKEN_CACHE_KEY);
+            if (token == null) {
+                logger.info("dingtalk:获取dingID的token");
+                JsonNode j = _renew_access_token();
+                if (j == null) {
+                    j = _renew_access_token();
+                    if (j == null) {
+                        throw new Exception("renew access token error");
+                    }
+                    logger.debug("retry in renew access token " + j.toString());
+                }
+                token = getJsonProperty(j, ACCESS_TOKEN_KEY);
+                long timeout = Integer.valueOf(getJsonProperty(j, "expires_in"));
+                sso_cache.put(ACCESS_TOKEN_CACHE_KEY, token, timeout, TimeUnit.SECONDS);
+            }
+            return token;
+        } catch (Exception e) {
+            logger.error(e);
+            e.printStackTrace(System.out);
+        }
+        return null;
+    }
+
+    private JsonNode _renew_access_token() {
+        try {
+            JsonNode j = getAccessToken().asJson();
+//            logger.info("request dingtalk access token " + j.toString());
+            return j;
+        } catch (Exception e) {
+            logger.error(e);
+            e.printStackTrace(System.out);
+        }
+        return null;
+    }
+
+    private String reset_access_token() {
+        sso_cache.remove(ACCESS_TOKEN_CACHE_KEY);
+        return get_access_token();
     }
 
     @Override
@@ -92,9 +172,9 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
         BrokeredIdentityContext user = new BrokeredIdentityContext(
                 (uuionid != null && uuionid.length() > 0 ? uuionid : getJsonProperty(profile, "openid")));
 
-        user.setUsername(getJsonProperty(profile, "openid"));
-        user.setBrokerUserId(getJsonProperty(profile, "openid"));
-        user.setModelUsername(getJsonProperty(profile, "openid"));
+        user.setUsername(getJsonProperty(profile, "userid"));
+        user.setBrokerUserId(getJsonProperty(profile, "userid"));
+        user.setModelUsername(getJsonProperty(profile, "userid"));
         user.setName(getJsonProperty(profile, "nick"));
         user.setIdpConfig(getConfig());
         user.setIdp(this);
@@ -102,16 +182,16 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
         return user;
     }
 
-    public BrokeredIdentityContext getFederatedIdentity(JsonNode response, String authorizationCode, boolean wechat) {
+    public BrokeredIdentityContext getFederatedIdentity(String accessToken, String authorizationCode, boolean dingtalk) {
 //        String accessToken = extractTokenFromResponse(response, getAccessTokenResponseParameter());
-        String accessToken = getJsonProperty(response, getAccessTokenResponseParameter());
+//        String accessToken = getJsonProperty(response, getAccessTokenResponseParameter());
         if (accessToken == null) {
-            throw new IdentityBrokerException("No access token available in OAuth server response: " + response);
+            throw new IdentityBrokerException("No access token available in OAuth server response");
         }
         BrokeredIdentityContext context = null;
         try {
             JsonNode profile = null;
-//            if (wechat) {
+//            if (dingtalk) {
 //                String openid = extractTokenFromResponse(response, "openid");
 //                String url = PROFILE_URL.replace("ACCESS_TOKEN", accessToken).replace("OPENID", openid);
 //                profile = SimpleHttp.doGet(url, session).asJson();
@@ -119,13 +199,13 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
 //                profile = new ObjectMapper().readTree(response);
 //            }
 
-            logger.info("4.dingtalk:获取用户token信息");
+            logger.info("4.dingtalk:获取用户token信息.");
             //获取openid信息
 //            profile = getUserInfoByCode(authorizationCode).asJson();
             String profileStr = getUserInfoByCode(authorizationCode).asString();
-            profileStr= new String(profileStr.getBytes("gbk"),"utf-8");
-            // logger.info("4.1.dingtalk:profile=" + profileStr);
-            profile=asJsonNode(profileStr);
+            profileStr = new String(profileStr.getBytes("gbk"), "utf-8");
+//            logger.info("4.1.dingtalk:profile=" + profileStr);
+            profile = asJsonNode(profileStr);
             String errcode = getJsonProperty(profile, "errcode");
             if (errcode == "0") {
                 JsonNode profile_user_info = profile.get("user_info");
@@ -133,12 +213,21 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
 
                 String unionid = getJsonProperty(profile_user_info, "unionid");
 
-                //            logger.info("4.2.dingtalk:获取用户userid信息");
-                //            //获取userid信息
-                //            String url = PROFILE_URL.replace("ACCESS_TOKEN", accessToken).replace("UNIONID", unionid);
-                //            JsonNode userfile = SimpleHttp.doGet(url, session).asJson();
-                //
-                //            logger.info("4.3.dingtalk:userfile="+userfile.toString());
+                logger.info("4.1.dingtalk:获取用户userid信息");
+                //获取userid信息
+                String url = PROFILE_URL.replace("ACCESS_TOKEN", accessToken).replace("UNIONID", unionid);
+                JsonNode userfile = SimpleHttp.doGet(url, session).asJson();
+                String user_id = unionid;
+                String user_errcode = getJsonProperty(userfile, "errcode");
+                if (user_errcode == "0") {
+                    user_id = getJsonProperty(userfile, "userid");
+                } else {
+                    logger.error("获取钉钉用户信息失败，" + userfile.toString());
+                }
+                String profile_user_info_str = profile_user_info.toString().replace("}", ",\"userid\":\"" + user_id + "\"}");
+                profile_user_info = asJsonNode(profile_user_info_str);
+
+                logger.info("4.1.1.dingtalk:userfile=" + profile_user_info.toString());
 
                 context = extractIdentityFromProfile(null, profile_user_info);
             } else {
@@ -162,8 +251,8 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
         try {
             URI authorizationUrl = createAuthorizationUrl(request).build();
             String ua = request.getHttpRequest().getHttpHeaders().getHeaderString("user-agent").toLowerCase();
-            if (isWechatBrowser(ua)) {
-                return Response.seeOther(URI.create(authorizationUrl.toString() + "#wechat_redirect")).build();
+            if (isDingTalkBrowser(ua)) {
+                return Response.seeOther(URI.create(authorizationUrl.toString() + "#dingtalk_redirect")).build();
             }
             return Response.seeOther(authorizationUrl).build();
         } catch (Exception e) {
@@ -177,15 +266,15 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
     }
 
     /**
-     * 判断是否在微信浏览器里面请求
+     * 判断是否在钉钉浏览器里面请求
      *
      * @param ua 浏览器user-agent
      * @return
      */
-    private boolean isWechatBrowser(String ua) {
+    private boolean isDingTalkBrowser(String ua) {
         String dingAppId = getConfig().getConfig().get(DING_APPID);
         String dingSecret = getConfig().getConfig().get(DING_APPIDKEY);
-        if (ua.indexOf(WECHATFLAG) > 0 && dingAppId != null && dingSecret != null
+        if (ua.indexOf(USER_AGENT) > 0 && dingAppId != null && dingSecret != null
                 && dingAppId.length() > 0 && dingSecret.length() > 0) {
             return true;
         }
@@ -196,37 +285,48 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
     //获取openid
     public SimpleHttp getUserInfoByCode(String authorizationCode) throws NoSuchAlgorithmException, InvalidKeyException, IOException {
         String timestamp = String.valueOf(System.currentTimeMillis());
-        String url=String.format("%s?accessKey=%s&timestamp=%s&signature=%s",API_User,getConfig().getClientId(),timestamp,SHA256(timestamp));
-        // logger.info("4.0.2.dingtalk:getUserInfoByCode=>"+url);
+        String url = String.format("%s?accessKey=%s&timestamp=%s&signature=%s", API_User, getConfig().getClientId(), timestamp, SHA256(timestamp));
+//        logger.info("4.0.2.dingtalk:getUserInfoByCode=>"+url);
         Map params = new HashMap<String, String>();
         params.put("tmp_auth_code", authorizationCode);
         return SimpleHttp.doPost(url, session).json(params);
-                // .param("accessKey", getConfig().getClientId())
-                // .param("timestamp", timestamp)
-                // .param("signature", SHA256(timestamp));
     }
+
     private String SHA256(String timestamp) throws IOException, NoSuchAlgorithmException, InvalidKeyException {
         // 根据timestamp, appSecret计算签名值
         String stringToSign = timestamp;
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(getConfig().getClientSecret().getBytes("UTF-8"), "HmacSHA256"));
         byte[] signatureBytes = mac.doFinal(stringToSign.getBytes("UTF-8"));
-        String signature = new String(Base64.encodeBase64(signatureBytes));
+//        String signature = new String(Base64.encodeBase64(signatureBytes));
+        String signature = Base64.getEncoder().encodeToString(signatureBytes);
         String urlEncodeSignature = urlEncode(signature);
-        // logger.info("4.0.1.dingtalk:构造signature=>"+"ClientSecret:"+getConfig().getClientSecret()+",timestamp:"+timestamp+",signature:"+signature+",signature:"+urlEncodeSignature);
+//        logger.info("4.0.1.dingtalk:构造signature=>"+"ClientSecret:"+getConfig().getClientSecret()+",timestamp:"+timestamp+",signature:"+signature+",signature:"+urlEncodeSignature);
         return urlEncodeSignature;
+    }
+
+    //获取access_token
+    public SimpleHttp getAccessToken() {
+        // 获取ding_appid的access_token
+        //https://oapi.dingtalk.com/gettoken?appkey=appkey&appsecret=appsecret
+        //String url = "%s?%s=%s&%s=%s";
+        String url = String.format("%s?%s=%s&%s=%s", getConfig().getTokenUrl(),
+                DING_PARAMETER_CLIENT_ID, getConfig().getConfig().get(DING_APPID),
+                DING_PARAMETER_CLIENT_SECRET, getConfig().getConfig().get(DING_APPIDKEY)
+        );
+        return SimpleHttp.doGet(url, session);
     }
 
     @Override
     protected UriBuilder createAuthorizationUrl(AuthenticationRequest request) {
-        // TODO:log
         logger.info("2.1.dingtalk:构造请求CODE的url");
         final UriBuilder uriBuilder;
         String ua = request.getHttpRequest().getHttpHeaders().getHeaderString("user-agent").toLowerCase();
-        if (isWechatBrowser(ua)) {// 是微信浏览器
-            logger.info("----------wechat");
-            uriBuilder = UriBuilder.fromUri(WECHAT_AUTH_URL);
-            uriBuilder.queryParam(OAUTH2_PARAMETER_SCOPE, WECHAT_DEFAULT_SCOPE)
+        if (isDingTalkBrowser(ua)) {// 是钉钉浏览器
+            logger.info("----------dingtalk");
+            //TODO:钉钉内登录
+            uriBuilder = UriBuilder.fromUri(DING_AUTH_URL);
+            uriBuilder.queryParam(OAUTH2_PARAMETER_SCOPE, DING_DEFAULT_SCOPE)
                     .queryParam(OAUTH2_PARAMETER_STATE, request.getState().getEncoded())
                     .queryParam(OAUTH2_PARAMETER_RESPONSE_TYPE, "code")
                     .queryParam(OAUTH2_PARAMETER_CLIENT_ID, getConfig().getConfig().get(DING_APPID))
@@ -298,10 +398,10 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
             // TODO:log
             logger.info("3.dingtalk:获取code回调");
             logger.info("OAUTH2_PARAMETER_CODE=" + authorizationCode);
-            boolean wechatFlag = false;
-            if (headers != null && isWechatBrowser(headers.getHeaderString("user-agent").toLowerCase())) {
-                logger.info("user-agent=wechat");
-                wechatFlag = true;
+            boolean user_agent_Flag = false;
+            if (headers != null && isDingTalkBrowser(headers.getHeaderString("user-agent").toLowerCase())) {
+                logger.info("user-agent=dingtalk");
+                user_agent_Flag = true;
             }
             if (error != null) {
                 // logger.error("Failed " + getConfig().getAlias() + " broker
@@ -318,17 +418,23 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
             try {
                 BrokeredIdentityContext federatedIdentity = null;
                 if (authorizationCode != null) {
+                    String access_token = get_access_token();
+//                    String access_token = getConfig().getConfig().get("access_token");
+//                    String expressStr = getConfig().getConfig().get("access_token_expires");
+//                    if (expressStr == null || Double.valueOf(expressStr) <= System.currentTimeMillis()) {
+//                        logger.info("3.1.dingtalk:获取dingID的token");
+//                        JsonNode response = generateTokenRequest().asJson();
+//                        logger.info("response=" + response);
+//                        access_token = getJsonProperty(response, "access_token");
+//                        expressStr = getJsonProperty(response, "expires_in");
+//                        getConfig().getConfig().put("access_token", access_token);
+//                        getConfig().getConfig().put("access_token_expires", String.valueOf(Double.valueOf(expressStr) * 1000 + System.currentTimeMillis()));
+//                    } else {
+//                        logger.info("3.1.dingtalk:缓存获取dingID的token");
+//                    }
                     logger.info("3.1.dingtalk:根据code获取UserInfo");
-                    JsonNode response = generateTokenRequest(authorizationCode, wechatFlag).asJson();
-                    logger.info("3.2.dingtalk:获取dingID的token");
-                    logger.info("response=" + response);
                     //根据code,access_token获取用户的openid及userid
-                    federatedIdentity = getFederatedIdentity(response, authorizationCode, wechatFlag);
-
-                    if (getConfig().isStoreToken()) {
-                        if (federatedIdentity.getToken() == null)
-                            federatedIdentity.setToken(response.toString());
-                    }
+                    federatedIdentity = getFederatedIdentity(access_token, authorizationCode, user_agent_Flag);
 
                     federatedIdentity.setIdpConfig(getConfig());
                     federatedIdentity.setIdp(DingTalkIdentityProvider.this);
@@ -354,31 +460,5 @@ public class DingTalkIdentityProvider extends AbstractOAuth2IdentityProvider<OAu
                     .param(OAUTH2_PARAMETER_REDIRECT_URI, uriInfo.getAbsolutePath().toString())
                     .param(OAUTH2_PARAMETER_GRANT_TYPE, OAUTH2_GRANT_TYPE_AUTHORIZATION_CODE);
         }
-
-        //获取access_token
-        public SimpleHttp generateTokenRequest(String authorizationCode, boolean wechat) {
-            if (wechat) {
-                return SimpleHttp.doPost(WECHAT_TOKEN_URL, session)
-                        .param(OAUTH2_PARAMETER_CODE, authorizationCode)
-                        .param(OAUTH2_PARAMETER_CLIENT_ID, getConfig().getConfig().get(DING_APPID))
-                        .param(OAUTH2_PARAMETER_CLIENT_SECRET, getConfig().getConfig().get(DING_APPIDKEY))
-                        .param(OAUTH2_PARAMETER_REDIRECT_URI, uriInfo.getAbsolutePath().toString())
-                        .param(OAUTH2_PARAMETER_GRANT_TYPE, OAUTH2_GRANT_TYPE_AUTHORIZATION_CODE);
-            }
-            // 获取ding_appid的access_token
-            //https://oapi.dingtalk.com/gettoken?appkey=appkey&appsecret=appsecret
-            //String url = "%s?%s=%s&%s=%s";
-            String url = String.format("%s?%s=%s&%s=%s", getConfig().getTokenUrl(),
-                    DING_PARAMETER_CLIENT_ID, getConfig().getConfig().get(DING_APPID),
-                    DING_PARAMETER_CLIENT_SECRET, getConfig().getConfig().get(DING_APPIDKEY)
-            );
-            return SimpleHttp.doGet(url, session);
-//            return SimpleHttp.doPost(getConfig().getTokenUrl(), session).param(OAUTH2_PARAMETER_CODE, authorizationCode)
-//                    .param(OAUTH2_PARAMETER_CLIENT_ID, getConfig().getClientId())
-//                    .param(OAUTH2_PARAMETER_CLIENT_SECRET, getConfig().getClientSecret())
-//                    .param(OAUTH2_PARAMETER_REDIRECT_URI, uriInfo.getAbsolutePath().toString())
-//                    .param(OAUTH2_PARAMETER_GRANT_TYPE, OAUTH2_GRANT_TYPE_AUTHORIZATION_CODE);
-        }
-
     }
 }
